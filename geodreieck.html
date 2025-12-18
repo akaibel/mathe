@@ -1,0 +1,536 @@
+<!--
+  This file is part of Zeichenfläche mit Geodreieck.
+
+  Copyright (C) 2025 Andreas Kaibel
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Zeichenfläche mit Geodreieck</title>
+<style>
+body {
+  margin: 0;
+  background: #fff;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  font-family: sans-serif;
+}
+
+canvas {
+  touch-action: none;
+}
+
+#toolbar-left, #toolbar-right {
+  position: fixed;
+  bottom: 20px;
+  display: flex;
+  gap: 10px;
+  z-index: 10;
+}
+#toolbar-left { left: 20px; }
+#toolbar-right { right: 20px; }
+
+button {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  background: #f2f2f2;
+  font-size: 14px;
+}
+.color-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-shadow: 0 0 4px rgba(0,0,0,0.4);
+  padding: 0;
+}
+.color-btn.active {
+  border: 3px solid black;
+}
+
+#geo {
+  touch-action: none;
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: 600px;
+  opacity: 0.85;
+  touch-action: none;
+  z-index: 5;
+}
+
+#geo-mode {
+  position: fixed;
+  bottom: 80px;
+  left: 20px;
+  background: rgba(255,255,255,0.9);
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  z-index: 10;
+}
+</style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+<img id="geo" src="geodreieck.png" draggable="false">
+
+<input type="file" id="bg-file" accept="image/*" style="display:none">
+
+<div id="toolbar-left">
+  <button id="mode-free">Freihand</button>
+  <button id="mode-line">Linie</button>
+  <button id="mode-poly">Vieleck</button>
+  <button id="mode-bg">Hintergrund</button>
+  <input type="range" id="bg-opacity" min="0" max="100" value="100" style="width:80px; margin-left:10px;">
+  <button id="undo">Zurück</button>
+  <button id="clear-all">Löschen</button>
+</div>
+
+<div id="geo-mode">
+  <strong>Geodreieck</strong><br>
+  <label><input type="radio" name="geoScale" value="flexible" checked> flexibel</label><br>
+  <label><input type="radio" name="geoScale" value="fix"> feste Größe</label>
+</div>
+
+<div id="toolbar-right">
+  <button class="color-btn active" data-color="#000000" style="background:black;"></button>
+  <button class="color-btn" data-color="#ff0000" style="background:red;"></button>
+  <button class="color-btn" data-color="#0000ff" style="background:blue;"></button>
+  <button class="color-btn" data-color="#ff8800" style="background:orange;"></button>
+</div>
+
+<script>
+/* ==================== CANVAS & STATE ==================== */
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+const snap_abstand = 30;
+const snap_to = 0;
+const line_width = 2;
+
+let mode = 'free'; // line | free | poly | bg
+let currentColor = '#000000';
+let startPoint = null;
+let drawing = false;
+let polygonPoints = [];
+let freePoints = [];
+let history = [];
+
+let geoScaleMode = 'flexible';
+
+/* ==================== GEO ==================== */
+const geo = document.getElementById('geo');
+let baseTransform = { x:0, y:0, scale:1, angle:0 };
+let geoStartTransform = null;
+let touches = [];
+let startGesture = null;
+
+function cloneGeo(){ return {...baseTransform}; }
+function updateGeo(){
+  geo.style.transform = `translate(${baseTransform.x}px,${baseTransform.y}px) rotate(${baseTransform.angle}rad) scale(${baseTransform.scale})`;
+}
+
+
+function getDelta(prev, curr){
+  return {
+    dx: curr.clientX - prev.clientX,
+    dy: curr.clientY - prev.clientY
+  };
+}
+
+/* ==================== BACKGROUND ==================== */
+let bgImage = null;
+let bgTransform = { x:0, y:0, scale:1, angle:0 };
+let bgStartTransform = null;
+let bgTouches = [];
+let bgStartGesture = null;
+let bgOpacity = 1;
+const btnBg = document.getElementById('mode-bg');
+const bgFileInput = document.getElementById('bg-file');
+const bgOpacityInput = document.getElementById('bg-opacity');
+let bgClickTimeout = null;
+
+// Kurzer Klick → Hintergrundmodus aktivieren
+btnBg.addEventListener('click', () => {
+  if (!bgImage) {
+    bgFileInput.click(); // Erstes Mal Bild hochladen
+    return;
+  }
+
+  bgMode = true;
+  mode = 'bg';
+  setActive();
+});
+
+// Doppelklick → neues Bild hochladen
+btnBg.addEventListener('dblclick', () => {
+  bgFileInput.click();
+});
+
+bgFileInput.addEventListener('change',(e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  const img = new Image();
+  img.onload=()=>{
+    bgImage = img;
+    bgTransform = { x:0, y:0, scale:1, angle:0 };
+	// automatisch Hintergrund-Modus aktivieren
+    mode = 'bg';
+    setActive();
+    redrawCanvas();
+  };
+  img.src = URL.createObjectURL(file);
+  bgFileInput.value='';
+});
+bgOpacityInput.addEventListener('input',()=>{
+  bgOpacity = bgOpacityInput.value/100;
+  redrawCanvas();
+});
+
+/* ==================== TOOLBAR ==================== */
+const btnLine = document.getElementById('mode-line');
+const btnFree = document.getElementById('mode-free');
+const btnPoly = document.getElementById('mode-poly');
+const btnUndo  = document.getElementById('undo');
+const btnClear = document.getElementById('clear-all');
+
+function setActive(){
+  document.querySelectorAll('#toolbar-left button').forEach(b=>b.style.background='');
+  document.getElementById('mode-'+mode).style.background='lightgreen';
+}
+setActive();
+
+btnLine.onclick = ()=>{ mode='line'; setActive(); };
+btnFree.onclick = ()=>{ mode='free'; setActive(); };
+btnPoly.onclick = ()=>{ mode='poly'; polygonPoints=[]; setActive(); };
+btnUndo.onclick = ()=>{
+  const item = history.pop();
+  if(!item) return;
+  if(item.type==='geo') baseTransform={...item.from},updateGeo();
+  redrawCanvas();
+};
+btnClear.onclick = ()=>{
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  history=[]; polygonPoints=[]; startPoint=null;
+  baseTransform={x:0,y:0,scale:1,angle:0}; updateGeo();
+};
+
+/* ==================== COLORS ==================== */
+document.querySelectorAll('.color-btn').forEach(btn=>{
+  btn.onclick=()=>{
+    currentColor=btn.dataset.color;
+    document.querySelectorAll('.color-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+});
+
+/* ==================== GEO SCALE ==================== */
+document.querySelectorAll('input[name="geoScale"]').forEach(r=>{
+  r.addEventListener('change',()=>geoScaleMode=r.value);
+});
+
+/* ==================== REDRAW ==================== */
+function redrawCanvas(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // background
+  if(bgImage){
+    ctx.save();
+    ctx.translate(bgTransform.x + canvas.width/2, bgTransform.y + canvas.height/2);
+    ctx.rotate(bgTransform.angle);
+    ctx.scale(bgTransform.scale,bgTransform.scale);
+    ctx.globalAlpha = bgOpacity;
+    ctx.drawImage(bgImage,-bgImage.width/2,-bgImage.height/2);
+    ctx.restore();
+    ctx.globalAlpha =1;
+  }
+  for(const item of history){
+    if(item.type==='geo') continue;
+    ctx.strokeStyle=item.color;
+    ctx.lineWidth=line_width;
+    ctx.beginPath();
+    if(item.type==='line'){ ctx.moveTo(item.a.x,item.a.y); ctx.lineTo(item.b.x,item.b.y); }
+    if(item.type==='free'||item.type==='poly'){ ctx.moveTo(item.points[0].x,item.points[0].y); item.points.forEach(p=>ctx.lineTo(p.x,p.y)); if(item.type==='poly') ctx.closePath(); }
+    ctx.stroke();
+  }
+}
+
+/* ==================== SNAP ==================== */
+function transformGeoPoint(px,py){
+  const w=geo.width,h=geo.height;
+  let x=px-w/2,y=py-h/2;
+  x*=baseTransform.scale; y*=baseTransform.scale;
+  const cosA=Math.cos(baseTransform.angle), sinA=Math.sin(baseTransform.angle);
+  const xr=x*cosA - y*sinA, yr=x*sinA + y*cosA;
+  return {x:xr + geo.offsetLeft + w/2 + baseTransform.x, y:yr + geo.offsetTop + h/2 + baseTransform.y};
+}
+function distPointToLine(P,A,B){ return Math.abs((B.x-A.x)*(A.y-P.y)-(A.x-P.x)*(B.y-A.y))/Math.hypot(B.x-A.x,B.y-A.y); }
+
+function snapToGeo(Px, Py) {
+  const w = geo.width, h = geo.height;
+  const A = transformGeoPoint(0, h);
+  const B = transformGeoPoint(w, h);
+
+  const ABx = B.x - A.x;
+  const ABy = B.y - A.y;
+  const lenAB = Math.hypot(ABx, ABy);
+
+  const distance = distPointToLine({ x: Px, y: Py }, A, B);
+  if (distance > snap_abstand) {
+    return { x: Px, y: Py, snapped: false };
+  }
+
+  const ux = ABx / lenAB;
+  const uy = ABy / lenAB;
+  const nx = -uy;
+  const ny = ux;
+
+  const APx = Px - A.x;
+  const APy = Py - A.y;
+
+  const proj = APx * ux + APy * uy;
+
+  // 🔒 NUR echtes Segment, KEINE Endpunkte
+  if (proj <= 0 || proj >= lenAB) {
+    return { x: Px, y: Py, snapped: false };
+  }
+
+  const Fx = A.x + proj * ux;
+  const Fy = A.y + proj * uy;
+
+  return {
+    x: Fx,
+    y: Fy,
+    snapped: true
+  };
+}
+
+/* ==================== DRAWING ==================== */
+canvas.addEventListener('pointerdown', e=>{
+  if(mode==='bg'){
+    e.preventDefault();
+  }
+  canvas.setPointerCapture(e.pointerId);
+  const p = snapToGeo(e.clientX,e.clientY);
+
+  if(mode==='bg'){
+    bgTouches.push(e);
+    if(!bgStartTransform) bgStartTransform={...bgTransform};
+    return;
+  }
+
+  if(mode==='line'){ if(!startPoint) startPoint=p; else{ ctx.strokeStyle=currentColor; ctx.lineWidth=line_width; ctx.beginPath(); ctx.moveTo(startPoint.x,startPoint.y); ctx.lineTo(p.x,p.y); ctx.stroke(); history.push({type:'line',color:currentColor,a:startPoint,b:p}); startPoint=null; } }
+  if(mode==='free'){ drawing=true; freePoints=[p]; ctx.strokeStyle=currentColor; ctx.beginPath(); ctx.moveTo(p.x,p.y); }
+  if(mode==='poly'){
+    if(polygonPoints.length>2){
+      const first=polygonPoints[0];
+      if(Math.hypot(p.x-first.x,p.y-first.y)<20){
+        ctx.strokeStyle=currentColor; ctx.lineWidth=line_width; ctx.beginPath();
+        ctx.moveTo(first.x,first.y);
+        polygonPoints.forEach(pt=>ctx.lineTo(pt.x,pt.y));
+        ctx.closePath(); ctx.stroke();
+        history.push({type:'poly',color:currentColor,points:[...polygonPoints]});
+        polygonPoints=[];
+        return;
+      }
+    }
+    polygonPoints.push(p);
+    if(polygonPoints.length>1){
+      const a=polygonPoints.at(-2),b=polygonPoints.at(-1);
+      ctx.strokeStyle=currentColor; ctx.lineWidth=line_width; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+  }
+});
+
+canvas.addEventListener('pointermove', e=>{
+  if(mode==='bg' && bgTouches.length>0){
+    e.preventDefault();
+
+    // 🔹 alten Touch ZUERST merken
+    const prev = bgTouches.find(t=>t.pointerId === e.pointerId);
+
+    // 🔹 dann Touch aktualisieren
+    bgTouches = bgTouches.map(t=>t.pointerId === e.pointerId ? e : t);
+
+    // 🔹 Verschieben (1 Finger)
+    if(bgTouches.length === 1 && prev){
+      const dx = e.clientX - prev.clientX;
+      const dy = e.clientY - prev.clientY;
+      bgTransform.x += dx;
+      bgTransform.y += dy;
+      redrawCanvas();
+    }
+
+    // 🔹 Pinch / Rotate (2 Finger)
+    if(bgTouches.length === 2){
+      const [a,b] = bgTouches;
+      const dx = b.clientX - a.clientX;
+      const dy = b.clientY - a.clientY;
+      const dist = Math.hypot(dx,dy);
+      const angle = Math.atan2(dy,dx);
+
+      if(!bgStartGesture){
+        bgStartGesture = {
+          dist,
+          angle,
+          scale: bgTransform.scale,
+          rotation: bgTransform.angle
+        };
+      }
+
+      bgTransform.scale =
+        bgStartGesture.scale * (dist / bgStartGesture.dist);
+      bgTransform.angle =
+        bgStartGesture.rotation + (angle - bgStartGesture.angle);
+
+      redrawCanvas();
+    }
+    return;
+  }
+
+  // normales Zeichnen
+  if(mode==='free' && drawing){
+    const p = snapToGeo(e.clientX,e.clientY);
+    ctx.strokeStyle=currentColor;
+    freePoints.push(p);
+    ctx.lineTo(p.x,p.y);
+    ctx.stroke();
+  }
+});
+
+canvas.addEventListener('pointerup', e=>{
+  canvas.releasePointerCapture(e.pointerId);
+  if(mode==='bg'){
+    if(bgTouches.length>0){e.preventDefault();}
+    bgTouches = bgTouches.filter(t=>t.pointerId!==e.pointerId);
+    if(bgTouches.length<2) bgStartGesture=null;
+    if(bgTouches.length===0) bgStartTransform=null;
+    return;
+  }
+  if(mode==='free'&&freePoints.length>1) {
+    history.push({type:'free',color:currentColor,points:[...freePoints]});
+  }
+  drawing=false;
+});
+
+/* ==================== GEO POINTERS ==================== */
+geo.addEventListener('pointerdown', e=>{
+  geo.setPointerCapture(e.pointerId); touches.push(e); if(!geoStartTransform) geoStartTransform=cloneGeo();
+});
+geo.addEventListener('pointermove', e=>{
+  e.preventDefault();
+
+  const prev = touches.find(t=>t.pointerId===e.pointerId);
+  touches = touches.map(t=>t.pointerId===e.pointerId?e:t);
+
+  if(touches.length===1 && prev){
+    const {dx,dy} = getDelta(prev,e);
+    baseTransform.x += dx;
+    baseTransform.y += dy;
+    updateGeo();
+  }
+
+if (touches.length === 2) {
+  const [a, b] = touches;
+  const dx = b.clientX - a.clientX;
+  const dy = b.clientY - a.clientY;
+  const dist = Math.hypot(dx, dy);
+  const ang  = Math.atan2(dy, dx);
+
+  const w = geo.width;
+  const h = geo.height;
+  const localPivot = { x: w / 2, y: h };
+
+  function transformWithAngle(angle) {
+    let x = localPivot.x - w / 2;
+    let y = localPivot.y - h / 2;
+
+    x *= baseTransform.scale;
+    y *= baseTransform.scale;
+
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+
+    return {
+      x: x * cosA - y * sinA + geo.offsetLeft + w / 2 + baseTransform.x,
+      y: x * sinA + y * cosA + geo.offsetTop  + h / 2 + baseTransform.y
+    };
+  }
+
+  if (!startGesture) {
+    startGesture = {
+      dist,
+      ang,
+      scale: baseTransform.scale,
+      angle: baseTransform.angle
+    };
+  }
+
+  const P_before = transformWithAngle(baseTransform.angle);
+
+  if (geoScaleMode === 'flexible') {
+    baseTransform.scale = startGesture.scale * (dist / startGesture.dist);
+  }
+
+  baseTransform.angle = startGesture.angle + (ang - startGesture.ang);
+
+  const P_after = transformWithAngle(baseTransform.angle);
+
+  baseTransform.x += (P_before.x - P_after.x);
+  baseTransform.y += (P_before.y - P_after.y);
+
+  updateGeo();
+}
+});
+geo.addEventListener('pointerup', e=>{
+  geo.releasePointerCapture(e.pointerId);
+  touches=touches.filter(t=>t.pointerId!==e.pointerId);
+  if(touches.length===0 && geoStartTransform){ history.push({type:'geo',from:geoStartTransform,to:cloneGeo()}); geoStartTransform=null; startGesture=null; }
+});
+
+/* ==================== GEO MOUSEWHEEL ==================== */
+geo.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const delta = e.deltaY>0?0.5:-0.5;
+  const angleDelta = delta*Math.PI/180;
+  const w=geo.width, h=geo.height;
+  const localPivot={x:w/2,y:h};
+  function transformPointWithAngle(px,py,angle){
+    let x=px-w/2, y=py-h/2;
+    x*=baseTransform.scale; y*=baseTransform.scale;
+    const cosA=Math.cos(angle), sinA=Math.sin(angle);
+    const xr=x*cosA - y*sinA, yr=x*sinA + y*cosA;
+    return {x:xr+geo.offsetLeft+w/2+baseTransform.x, y:yr+geo.offsetTop+h/2+baseTransform.y};
+  }
+  const P_before=transformPointWithAngle(localPivot.x, localPivot.y, baseTransform.angle);
+  baseTransform.angle += angleDelta;
+  const P_after=transformPointWithAngle(localPivot.x, localPivot.y, baseTransform.angle);
+  baseTransform.x += (P_before.x-P_after.x); baseTransform.y += (P_before.y-P_after.y);
+  updateGeo();
+});
+
+</script>
+</body>
+</html>
